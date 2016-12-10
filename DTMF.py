@@ -1,124 +1,245 @@
-# DTMF.py: Dual Tone Multi-Frquency DTMF encoder and decoder
-#	 By running this program, p2.wav is generated from 
-#	 DTMF signal encoded from the user-input key
-#	 
-# 12/8/2003
-# Jiwon Hahn
+#!/usr/bin/bash
+#Modified by MonsieurVechai (taken from https://github.com/boxcarton/speech-sentiment-python/blob/master/speech_sentiment_python/recorder.py)
+from sys import byteorder
+from array import array
+from struct import pack
+import os
+import pyaudio
+import wave
+import math
+import struct
 
-from wave import *
-from math import *
-from sys import *
+#Uncomment the next line if used on Raspberry Pi
+#os.system("modprobe snd_bcm2835")
+THRESHOLD = 400
+CHUNK_SIZE = 1024
+FORMAT = pyaudio.paInt16
+RATE = 4096
 
-PI2 = 6.283185306
-scale = 32767 #16-bit unsigned short
-FR = 44000 #framerate
+def is_silent(snd_data):
+    "Returns 'True' if below the 'silent' threshold"
+    return max(snd_data) < THRESHOLD
 
-keys=   '1','2','3','A',\
-	'4','5','6','B',\
-	'7','8','9','C',\
-	'*','0','#','D'
-F1 = [697,770,852,941]
-F2 = [1209, 1336, 1477, 1633]
+def normalize(snd_data):
+    "Average the volume out"
+    MAXIMUM = 16384
+    times = float(MAXIMUM)/max(abs(i) for i in snd_data)
+
+    r = array('h')
+    for i in snd_data:
+        r.append(int(i*times))
+    return r
+
+def trim(snd_data):
+    "Trim the blank spots at the start and end"
+    def _trim(snd_data):
+        snd_started = False
+        r = array('h')
+
+        for i in snd_data:
+            if not snd_started and abs(i)>THRESHOLD:
+                snd_started = True
+                r.append(i)
+
+            elif snd_started:
+                r.append(i)
+        return r
+
+    # Trim to the left
+    snd_data = _trim(snd_data)
+
+    # Trim to the right
+    snd_data.reverse()
+    snd_data = _trim(snd_data)
+    snd_data.reverse()
+    return snd_data
+
+def add_silence(snd_data, seconds):
+    "Add silence to the start and end of 'snd_data' of length 'seconds' (float)"
+    r = array('h', [0 for i in xrange(int(seconds*RATE))])
+    r.extend(snd_data)
+    r.extend([0 for i in xrange(int(seconds*RATE))])
+    return r
+
+def record():
+    """
+    Record a word or words from the microphone and 
+    return the data as an array of signed shorts.
+
+    Normalizes the audio, trims silence from the 
+    start and end, and pads with 0.5 seconds of 
+    blank sound to make sure VLC et al can play 
+    it without getting chopped off.
+    """
+    p = pyaudio.PyAudio()
+    stream = p.open(format=FORMAT,
+                    channels=1,
+                    rate=RATE,
+                    input=True,
+                    output=True,
+                    frames_per_buffer=CHUNK_SIZE)
+
+    num_silent = 0
+    snd_started = False
+
+    r = array('h')
+
+    while 1:
+        # little endian, signed short
+        snd_data = array('h', stream.read(CHUNK_SIZE))
+        if byteorder == 'big':
+            snd_data.byteswap()
+        r.extend(snd_data)
+
+        silent = is_silent(snd_data)
+
+        if silent and snd_started:
+            num_silent += 1
+        elif not silent and not snd_started:
+            print "SOUND DETECTED"
+            snd_started = True
+        if snd_started and num_silent > 30:
+            break
+
+    sample_width = p.get_sample_size(FORMAT)
+    stream.stop_stream()
+    stream.close()
+    p.terminate()
+
+    r = normalize(r)
+    r = trim(r)
+    r = add_silence(r, 0.5)
+    return sample_width, r
+
+def record_to_file(path):
+    "Records from the microphone and outputs the resulting data to 'path'"
+    sample_width, data = record()
+    data = pack('<' + ('h'*len(data)), *data)
+
+    wf = wave.open(path, 'wb')
+    wf.setnchannels(1)
+    wf.setsampwidth(sample_width)
+    wf.setframerate(RATE)
+    wf.writeframes(data)
+    wf.close()
 
 
-# Encoder takes a symbol X as input and generate a
-# corresponding one second long DTMF tone, sampled at 
-# 44,000 16-bit samples/sec, and store it in a wav file.
+class pygoertzel_dtmf:
+    def __init__(self, samplerate):
+        self.samplerate = samplerate
+        self.goertzel_freq = [1209.0,1336.0,1477.0,1633.0,697.0,770.0,852.0,941.0]
+        self.s_prev = {}
+        self.s_prev2 = {}
+        self.totalpower = {}
+        self.N = {}
+        self.coeff = {}
+        # create goertzel parameters for each frequency so that
+        # all the frequencies are analyzed in parallel
+        for k in self.goertzel_freq:
+            self.s_prev[k] = 0.0
+            self.s_prev2[k] = 0.0
+            self.totalpower[k] = 0.0
+            self.N[k] = 0.0
+            normalizedfreq = k / self.samplerate
+            self.coeff[k] = 2.0*math.cos(2.0 * math.pi * normalizedfreq)
+    def __get_number(self, freqs):
+        hi = [1209.0,1336.0,1477.0,1633.0]
+        lo = [697.0,770.0,852.0,941.0]
+        # get hi freq
+        hifreq = 0.0
+        hifreq_v = 0.0
+        for f in hi:
+            if freqs[f]>hifreq_v:
+                hifreq_v = freqs[f]
+                hifreq = f
+        # get lo freq
+        lofreq = 0.0
+        lofreq_v = 0.0
+        for f in lo:
+            if freqs[f]>lofreq_v:
+                lofreq_v = freqs[f]
+                lofreq = f
+        if lofreq==697.0:
+            if hifreq==1209.0:
+                return "1"
+            elif hifreq==1336.0:
+                return "2"
+            elif hifreq==1477.0:
+                return "3"
+            elif hifreq==1633.0:
+                return "A"
+        elif lofreq==770.0:
+            if hifreq==1209.0:
+                return "4"
+            elif hifreq==1336.0:
+                return "5"
+            elif hifreq==1477.0:
+                return "6"
+            elif hifreq==1633.0:
+                return "B"
+        elif lofreq==852.0:
+            if hifreq==1209.0:
+                return "7"
+            elif hifreq==1336.0:
+                return "8"
+            elif hifreq==1477.0:
+                return "9"
+            elif hifreq==1633.0:
+                return "C"
+        elif lofreq==941.0:
+            if hifreq==1209.0:
+                return "*"
+            elif hifreq==1336.0:
+                return "0"
+            elif hifreq==1477.0:
+                return "#"
+            elif hifreq==1633.0:
+                return "D"
+    def run(self, sample):
+        freqs = {}
+        for freq in self.goertzel_freq:
+            s = sample + (self.coeff[freq] * self.s_prev[freq]) - self.s_prev2[freq]
+            self.s_prev2[freq] = self.s_prev[freq]
+            self.s_prev[freq] = s
+            self.N[freq]+=1
+            power = (self.s_prev2[freq]*self.s_prev2[freq]) + (self.s_prev[freq]*self.s_prev[freq]) - (self.coeff[freq]*self.s_prev[freq]*self.s_prev2[freq])
+            self.totalpower[freq]+=sample*sample
+            if (self.totalpower[freq] == 0):
+                self.totalpower[freq] = 1
+            freqs[freq] = power / self.totalpower[freq] / self.N[freq]
+        return self.__get_number(freqs)
 
-def encoder(symbol):
-	for i in range(16):
-		if symbol == keys[i]:
-			f1 = F1[i/4] #row
-			f2 = F2[i%4] #column
-	data = range(FR)
-	for i in range(FR):
-		p = i*1.0/FR
-		data[i]=int(scale+(sin(p*f1*PI2)+sin(p*f2*PI2))/2*scale)
-	store_wav(data)
-
-# endian inversion for unsigned 8 bit	
-def inv_endian(num):
-	b=num2bit(num)
-	N=len(b)
-	sum = 0
-	for i in range(N):
-		sum += int(b.pop(0))*2**i
-	return sum
-
-def num2bit(num): #8bit
-	b = []
-	for i in range(7,-1,-1):
-		if num>= 2**i:
-			b.append('1')
-			num-=2**i
-		else:	b.append('0')
-	return b
-	
-def store_wav(data):
-	fout = open('p2.wav', 'w')
-	#nchannel,sampwidth,framerate,nframes,comptype, compname
-	fout.setparams((1,2,FR,FR,'NONE','not compressed'))	
-	for i in range(FR):
-		MS8bit = data[i]>>8
-		LS8bit = data[i]-(MS8bit<<8)
-	#	m,l= inv_endian(MS8bit),inv_endian(LS8bit)
-	#	l,m= inv_endian(MS8bit),inv_endian(LS8bit)
-	#	fout.writeframes(chr(l)+chr(m)) 
-		fout.writeframes(chr(LS8bit)+chr(MS8bit))
-	fout.close()
-
-def read_wav():
-	fin = open('p2.wav','r')
-	n = fin.getnframes()
-	d = fin.readframes(n)
-	fin.close()
-	
-	data = []
-	for i in range(n):
-		#LS8bit = inv_endian(ord(d[2*i]))
-		#MS8bit = inv_endian(ord(d[2*i+1]))
-		LS8bit, MS8bit = ord(d[2*i]),ord(d[2*i+1])
-		data.append((MS8bit<<8)+LS8bit)
-	return data 
-
-
-# Decoder takes a DTMF signal file (.wav), sampled at 44,000
-# 16-bit samples per second, and decode the corresponding symbol X.
-
-def decoder():
-	data = read_wav()
-	temp = []	
-	for f1 in F1:
-		for f2 in F2:
-			diff = 0
-			for i in range(FR): #assume phase has not shifted dramatically	
-				p = i*1.0/FR
-				S=int(scale+scale*(sin(p*f1*PI2)+sin(p*f2*PI2))/2)
-				diff += abs(S-data[i])
-			temp.append((diff,f1,f2))
-	f1,f2 = min(temp)[1:] #retrieve the frequency of minimum signal distortion 
-	i, j = F1.index(f1), F2.index(f2)	
-	X = keys[4*i+j]
-	print 'Decoded key is: ', X
-	return X
-
-	
-def menu():
-	while 1:
-		print '**************************'
-		print '1\t2\t3\tA'
-		print '4\t5\t6\tB'
-		print '7\t8\t9\tC'
-		print '*\t0\t#\tD'
-		print '**************************'
-		X = raw_input('Enter a key, or x to exit: ') 
-		if X not in keys: 
-			if X is 'x': exit(0)
-			print 'Invalid key...';
-		else: return X
-
-
-if __name__=='__main__':
-	X = menu()
-	encoder(X)
-	x = decoder()	
+if __name__ == '__main__':
+    print("please speak a word into the microphone")
+    record_to_file('demo.wav')
+    print("done - result written to demo.wav")
+    print("Analyzing")
+    
+    wav = wave.open('demo.wav', 'r')
+    (nchannels, sampwidth, framerate, nframes, comptype, compname) = wav.getparams()
+    frames = wav.readframes(nframes * nchannels)
+    # convert wave file to array of integers
+    frames = struct.unpack_from("%dH" % nframes * nchannels, frames)
+    # if stereo get left/right
+    if nchannels == 2:
+        left = [frames[i] for i in range(0,len(frames),2)]
+        right = [frames[i] for i in range(1,len(frames),2)]
+    else:
+        left = frames
+        right = left
+    binsize = 400
+    # Split the bin in 4 to average out errors due to noise
+    binsize_split = 4
+    prevvalue = ""
+    prevcounter = 0
+    for i in range(0,len(left)-binsize,binsize/binsize_split):
+        goertzel = pygoertzel_dtmf(framerate)
+        for j in left[i:i+binsize]:
+            value = goertzel.run(j)
+        if value==prevvalue:
+            prevcounter+=1
+            if prevcounter==10:
+                print value
+        else:
+            prevcounter=0
+            prevvalue=value
